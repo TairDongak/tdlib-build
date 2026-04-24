@@ -1,0 +1,130 @@
+name: Build tdlib for Windows (Java)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+
+jobs:
+
+  build-tdlib:
+
+    runs-on: windows-latest
+
+    env:
+      VCPKG_DIR: ${{ github.workspace }}/vcpkg          # Где будет vcpkg
+      TDLIB_DIR: ${{ github.workspace }}/td             # Где исходники tdlib
+      BUILD_DIR: ${{ github.workspace }}/td/build       # Папка для сборки
+      INSTALL_DIR: ${{ github.workspace }}/tdlib-result # Готовые .dll и .jar
+
+    steps:
+    
+      # ШАГ 1: Получить исходники tdlib
+
+      - name: "1. Клонируем tdlib"
+        uses: actions/checkout@v4
+        with:
+          repository: tdlib/td          # Чужой репозиторий — tdlib
+          path: td                      # Куда сохранить (папка td/)
+          # Клонируем только последний коммит для скорости:
+          fetch-depth: 1
+
+      # ШАГ 2: Установить Java
+
+      - name: "2. Устанавливаем Java JDK 17"
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # ШАГ 3: Установить gperf и PHP через Chocolatey
+
+      - name: "3. Устанавливаем gperf и PHP"
+        run: |
+          choco install gperf php --no-progress -y
+          # Проверяем, что установилось:
+          gperf --version
+          php --version
+
+      # ШАГ 4: Настроить кэш для vcpkg
+      # Сборка OpenSSL и zlib через vcpkg занимает ~15-20 минут.
+
+      - name: "4. Кэш vcpkg"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_DIR }}/installed
+            ${{ env.VCPKG_DIR }}/packages
+            ${{ env.VCPKG_DIR }}/buildtrees
+          key: vcpkg-windows-x64-openssl-zlib-${{ hashFiles('**/vcpkg.json') }}
+          restore-keys: |
+            vcpkg-windows-x64-openssl-zlib-
+
+      # ШАГ 5: Установить vcpkg и собрать зависимости
+
+      - name: "5. Устанавливаем vcpkg и зависимости (OpenSSL, zlib)"
+        run: |
+          git clone --depth=1 https://github.com/Microsoft/vcpkg.git ${{ env.VCPKG_DIR }}
+
+          & "${{ env.VCPKG_DIR }}/bootstrap-vcpkg.bat" -disableMetrics
+
+          # Устанавливаем нужные библиотеки для архитектуры x64-windows:
+          # openssl — шифрование (нужен tdlib для работы с Telegram API)
+          # zlib    — сжатие данных
+          & "${{ env.VCPKG_DIR }}/vcpkg.exe" install openssl:x64-windows zlib:x64-windows
+
+      # ШАГ 6: Конфигурируем сборку через CMake
+
+      - name: "6. Конфигурируем CMake"
+        working-directory: ${{ env.TDLIB_DIR }}
+        run: |
+          cmake -B build `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DTD_ENABLE_JNI=ON `
+            -DCMAKE_INSTALL_PREFIX="${{ env.INSTALL_DIR }}" `
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_DIR }}/scripts/buildsystems/vcpkg.cmake"
+        # Расшифровка флагов:
+        # -B build                   → папка для файлов сборки
+        # -A x64                     → архитектура 64-бит (обязательно для Windows)
+        # -DCMAKE_BUILD_TYPE=Release → оптимизированная сборка (не Debug)
+        # -DTD_ENABLE_JNI=ON         → ГЛАВНЫЙ флаг: включает Java Native Interface, без него Java-вариант не соберётся
+        # -DCMAKE_INSTALL_PREFIX     → куда положить готовые файлы после сборки
+        # -DCMAKE_TOOLCHAIN_FILE     → говорит CMake использовать библиотеки из vcpkg
+
+      # ШАГ 7: Компилируем. На tdlib это долго: 30-60 минут на GitHub Actions.
+      - name: "7. Собираем tdlib"
+        working-directory: ${{ env.TDLIB_DIR }}
+        run: |
+          cmake --build build --config Release --target install --parallel
+
+        # --target install  → после сборки скопировать .dll/.lib в INSTALL_DIR
+        # --parallel        → использовать все доступные ядра процессора
+
+      # ШАГ 8: Проверяем результат
+
+      - name: "8. Проверяем результаты сборки"
+        run: |
+          echo "=== Содержимое папки с результатами ==="
+          Get-ChildItem -Recurse "${{ env.INSTALL_DIR }}" | Select-Object FullName
+
+          echo "=== Ищем tdjni.dll ==="
+          $dll = Get-ChildItem -Recurse "${{ env.INSTALL_DIR }}" -Filter "tdjni.dll"
+          if ($dll) {
+            echo "УСПЕХ: tdjni.dll найден по пути: $($dll.FullName)"
+          } else {
+            echo "ПРЕДУПРЕЖДЕНИЕ: tdjni.dll не найден"
+          }
+
+      # ШАГ 9: Сохранить артефакты
+
+      - name: "9. Сохраняем артефакты (готовые .dll и .jar файлы)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-windows-java          # Имя архива в интерфейсе GitHub
+          path: ${{ env.INSTALL_DIR }}      # Что сохранить
+          retention-days: 14                # Хранить 14 дней
+          if-no-files-found: warn           # Предупредить если файлов нет
